@@ -25,3 +25,10 @@ type InstallResponse struct {
 	RootUser string `json:"root_user,omitempty"`
 	RootPass string `json:"root_pass,omitempty"`
 }
+
+type JobStatusResponse struct {
+	IP     string           `json:"ip"`
+	Status string           `json:"status"`
+	Logs   string           `json:"logs"`
+	Result *InstallResponse `json:"result,omitempty"`
+}
