@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"time"
@@ -15,88 +14,48 @@ type DiscordLogger struct {
 }
 
 func NewDiscordLogger() *DiscordLogger {
-	return &DiscordLogger{
-		WebhookURL: os.Getenv("DISCORD_WEBHOOK_URL"),
+	url := os.Getenv("DISCORD_WEBHOOK_URL")
+	if url == "" {
+		fmt.Println("WARNUNG: DISCORD_WEBHOOK_URL ist nicht gesetzt!")
 	}
+	return &DiscordLogger{WebhookURL: url}
 }
 
-func (l *DiscordLogger) LogError(context, message string, details string) {
+func (l *DiscordLogger) LogInfo(section, msg string) {
+	l.sendEmbed(section, msg, 5763719)
+}
+
+func (l *DiscordLogger) LogError(section, msg, err string) {
+	fullMsg := fmt.Sprintf("**Message:** %s\n\n**Error:**\n```\n%s\n```", msg, err)
+	l.sendEmbed(section, fullMsg, 15548997)
+}
+
+func (l *DiscordLogger) sendEmbed(title, description string, color int) {
 	if l.WebhookURL == "" {
-		fmt.Println("Discord Webhook URL not set. Logging to console only.")
-		fmt.Printf("[%s] ERROR: %s - %s\n", context, message, details)
+		fmt.Printf("[LOG %s] %s\n", title, description)
 		return
 	}
+
+	germanTime := time.Now().Format("02.01.2006 15:04:05")
 
 	payload := map[string]interface{}{
 		"embeds": []map[string]interface{}{
 			{
-				"title":       "FiveM Installer Error",
-				"description": fmt.Sprintf("**Context:** %s\n**Message:** %s", context, message),
-				"color":       15158332, // Red
-				"fields": []map[string]interface{}{
-					{
-						"name":  "Details",
-						"value": "```\n" + truncateString(details, 1000) + "\n```",
-					},
+				"title":       title,
+				"description": description,
+				"color":       color,
+				"footer": map[string]interface{}{
+					"text": "📅 " + germanTime + " Uhr",
 				},
-				"timestamp": time.Now().Format(time.RFC3339),
-			},
-		},
-	}
-
-	jsonPayload, err := json.Marshal(payload)
-	if err != nil {
-		fmt.Printf("Failed to marshal discord payload: %v\n", err)
-		return
-	}
-
-	resp, err := http.Post(l.WebhookURL, "application/json", bytes.NewBuffer(jsonPayload))
-	if err != nil {
-		fmt.Printf("Failed to send log to Discord: %v\n", err)
-		return
-	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			fmt.Printf("Failed to close response body: %v\n", err)
-		}
-	}(resp.Body)
-
-	if resp.StatusCode != 204 && resp.StatusCode != 200 {
-		fmt.Printf("Discord Webhook returned status: %d\n", resp.StatusCode)
-	}
-}
-
-func (l *DiscordLogger) LogInfo(context, message string) {
-	if l.WebhookURL == "" {
-		fmt.Printf("[%s] INFO: %s\n", context, message)
-		return
-	}
-
-	payload := map[string]interface{}{
-		"embeds": []map[string]interface{}{
-			{
-				"title":       "FiveM Installer Info",
-				"description": fmt.Sprintf("**Context:** %s\n**Message:** %s", context, message),
-				"color":       3066993, // Green
-				"timestamp":   time.Now().Format(time.RFC3339),
 			},
 		},
 	}
 
 	jsonPayload, _ := json.Marshal(payload)
-	_, err := http.Post(l.WebhookURL, "application/json", bytes.NewBuffer(jsonPayload))
+	resp, err := http.Post(l.WebhookURL, "application/json", bytes.NewBuffer(jsonPayload))
 	if err != nil {
+		fmt.Println("Discord Webhook Error:", err)
 		return
 	}
-}
-
-func truncateString(str string, num int) string {
-	if len(str) <= num {
-		return str
-	}
-	if num > 3 {
-		return str[:num-3] + "..."
-	}
-	return str[:num]
+	defer resp.Body.Close()
 }

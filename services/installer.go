@@ -1,24 +1,33 @@
 package services
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fivem-installer/models"
 	"fmt"
-	_ "log"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 )
 
-type Installer struct {
-	ScriptContent string
-	Logger        *DiscordLogger
+type Logger interface {
+	LogInfo(section, msg string)
+	LogError(section, msg, err string)
 }
 
-func NewInstaller(script string, logger *DiscordLogger) *Installer {
-	return &Installer{ScriptContent: script, Logger: logger}
+type Installer struct {
+	ScriptContent string
+	logger        Logger
+}
+
+func NewInstaller(scriptContent string, logger Logger) *Installer {
+	return &Installer{
+		ScriptContent: scriptContent,
+		logger:        logger,
+	}
 }
 
 func (s *Installer) Install(req models.InstallRequest) models.InstallResponse {
@@ -36,27 +45,30 @@ func (s *Installer) Install(req models.InstallRequest) models.InstallResponse {
 	if err != nil {
 		errStr := err.Error()
 		if strings.Contains(errStr, "unable to authenticate") {
-			s.Logger.LogError("SSH Connection", "Authentication Failed", errStr)
+			s.logger.LogError("SSH Connection", "Authentication Failed", errStr)
 			return errorResponse("Login fehlgeschlagen", "AUTH_ERROR", "Das angegebene Passwort oder der Benutzername ist falsch.\nOriginal: "+errStr)
 		}
 		if strings.Contains(errStr, "refused") || strings.Contains(errStr, "timeout") || strings.Contains(errStr, "no such host") {
-			s.Logger.LogError("SSH Connection", "Connection Failed", errStr)
+			s.logger.LogError("SSH Connection", "Connection Failed", errStr)
 			return errorResponse("Server nicht erreichbar", "CONN_ERROR", "Verbindung fehlgeschlagen.\nOriginal: "+errStr)
 		}
-		s.Logger.LogError("SSH Connection", "Unknown Error", errStr)
+		s.logger.LogError("SSH Connection", "Unknown Error", errStr)
 		return errorResponse("SSH Verbindungsfehler", "SSH_ERROR", errStr)
 	}
-	defer client.Close()
+	defer func(client *ssh.Client) {
+		_ = client.Close()
+	}(client)
 
 	session, err := client.NewSession()
 	if err != nil {
-		s.Logger.LogError("SSH Session", "Session Creation Failed", err.Error())
+		s.logger.LogError("SSH Session", "Session Creation Failed", err.Error())
 		return errorResponse("SSH Session Failed", "SESSION_ERROR", err.Error())
 	}
-	defer session.Close()
+	defer func(session *ssh.Session) {
+		_ = session.Close()
+	}(session)
 
 	var envVars strings.Builder
-
 	if req.InstallMySQL {
 		envVars.WriteString("export INSTALL_MYSQL=true\n")
 	} else {
@@ -68,18 +80,63 @@ func (s *Installer) Install(req models.InstallRequest) models.InstallResponse {
 	} else {
 		envVars.WriteString("export FORCE_OVERWRITE=false\n")
 	}
-
 	envVars.WriteString("export TERM=xterm\n")
 
-	fullScript := envVars.String() + "\n" + s.ScriptContent
+	cleanScript := strings.ReplaceAll(s.ScriptContent, "\r", "")
+
+	fullScript := envVars.String() + "\n" + cleanScript
 
 	session.Stdin = bytes.NewBufferString(fullScript)
 
-	outputBytes, err := session.CombinedOutput("bash")
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		return errorResponse("Pipe Error", "PIPE_ERROR", err.Error())
+	}
+	stderr, err := session.StderrPipe()
+	if err != nil {
+		return errorResponse("Pipe Error", "PIPE_ERROR", err.Error())
+	}
 
-	outputStr := string(outputBytes)
+	if err := session.Start("bash"); err != nil {
+		s.logger.LogError("SSH Start", "Command Start Failed", err.Error())
+		return errorResponse("Script Start Failed", "START_ERROR", err.Error())
+	}
 
-	return s.parseScriptOutput(outputStr, err)
+	var outputBuffer bytes.Buffer
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			text := scanner.Text()
+
+			if strings.Contains(text, "JSON_START") || strings.Contains(text, "JSON_END") {
+				outputBuffer.WriteString(text + "\n")
+				continue
+			}
+
+			s.logger.LogInfo("REMOTE", text)
+			outputBuffer.WriteString(text + "\n")
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			text := scanner.Text()
+			s.logger.LogInfo("REMOTE_ERR", text)
+			outputBuffer.WriteString(text + "\n")
+		}
+	}()
+
+	wg.Wait()
+	err = session.Wait()
+
+	fullOutput := outputBuffer.String()
+	return s.parseScriptOutput(fullOutput, err)
 }
 
 func (s *Installer) parseScriptOutput(output string, sshErr error) models.InstallResponse {
@@ -94,10 +151,11 @@ func (s *Installer) parseScriptOutput(output string, sshErr error) models.Instal
 		if sshErr != nil {
 			errMsg = sshErr.Error()
 		}
-		s.Logger.LogError("Script Execution", "Invalid JSON Output / Script Crash", output+"\n\nSSH Error: "+errMsg)
+		s.logger.LogError("Script Execution", "Invalid JSON Output", "SSH Error: "+errMsg)
+
 		return models.InstallResponse{
 			Success:   false,
-			Error:     "Script Error / SSH Error",
+			Error:     "Script Error / Invalid Output",
 			ErrorCode: "SCRIPT_CRASH",
 			RawLog:    output + "\n\nSSH Error: " + errMsg,
 		}
@@ -108,7 +166,7 @@ func (s *Installer) parseScriptOutput(output string, sshErr error) models.Instal
 
 	var resp models.InstallResponse
 	if err := json.Unmarshal([]byte(jsonStr), &resp); err != nil {
-		s.Logger.LogError("JSON Parsing", "Failed to unmarshal script response", jsonStr+"\nError: "+err.Error())
+		s.logger.LogError("JSON Parsing", "Failed to unmarshal script response", jsonStr+"\nError: "+err.Error())
 		return models.InstallResponse{
 			Success: false,
 			Error:   "JSON Parsing fehlgeschlagen",
@@ -117,9 +175,9 @@ func (s *Installer) parseScriptOutput(output string, sshErr error) models.Instal
 	}
 
 	if !resp.Success {
-		s.Logger.LogError("Installation Script", "Script reported failure", fmt.Sprintf("Error: %s\nCode: %s", resp.Error, resp.ErrorCode))
+		s.logger.LogError("Installation Script", "Script reported failure", fmt.Sprintf("Error: %s\nCode: %s", resp.Error, resp.ErrorCode))
 	} else {
-		s.Logger.LogInfo("Installation Script", "Installation successful on "+resp.TxAdminURL)
+		s.logger.LogInfo("Installation Script", "Installation successful on "+resp.TxAdminURL)
 	}
 
 	return resp
