@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
+	"golang.org/x/time/rate"
 )
 
 type Job struct {
@@ -22,10 +23,68 @@ type Job struct {
 	mu        sync.RWMutex
 }
 
+type IPRateLimiter struct {
+	ips map[string]*rate.Limiter
+	mu  sync.Mutex
+	r   rate.Limit
+	b   int
+}
+
 var (
 	jobStore = make(map[string]*Job)
 	storeMu  sync.RWMutex
 )
+
+func NewIPRateLimiter() *IPRateLimiter {
+	return &IPRateLimiter{
+		ips: make(map[string]*rate.Limiter),
+		r:   rate.Every(1 * time.Minute),
+		b:   5,
+	}
+}
+
+func (i *IPRateLimiter) GetLimiter(ip string) *rate.Limiter {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	limiter, exists := i.ips[ip]
+	if !exists {
+		limiter = rate.NewLimiter(i.r, i.b)
+		i.ips[ip] = limiter
+	}
+
+	return limiter
+}
+
+var limiter = NewIPRateLimiter()
+
+func rateLimitMiddleware(logger *services.DiscordLogger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ip := c.Request.Header.Get("X-Real-IP")
+		if ip == "" {
+			ip = c.ClientIP()
+		}
+
+		l := limiter.GetLimiter(ip)
+		if !l.Allow() {
+			msg := fmt.Sprintf("IP %s hat das Rate-Limit überschritten und wurde temporär blockiert.", ip)
+
+			fmt.Printf("[RateLimit] BLOCKIERT: %s\n", ip)
+
+			logger.LogError("Security", "Rate Limit Hit 🛡️", msg)
+
+			c.JSON(http.StatusTooManyRequests, models.InstallResponse{
+				Success:   false,
+				Error:     "Too many requests. Please try again later.",
+				ErrorCode: "RATE_LIMIT",
+			})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
 
 func getOrCreateJob(ip string) (*Job, bool) {
 	storeMu.Lock()
@@ -81,7 +140,7 @@ func (l *SessionLogger) LogInfo(section, msg string) {
 func (l *SessionLogger) LogError(section, msg, err string) {
 	fullMsg := fmt.Sprintf("%s | Error: %s", msg, err)
 	l.appendLog("ERROR/"+section, fullMsg)
-	
+
 	titleWithIP := fmt.Sprintf("%s | 🖥️ %s", section, l.Job.IP)
 
 	l.DiscordLogger.LogError(titleWithIP, msg, err)
@@ -89,11 +148,11 @@ func (l *SessionLogger) LogError(section, msg, err string) {
 
 func main() {
 	if err := godotenv.Load(); err != nil {
-		println("No .env file found")
+		println("No .env file found (using system env vars if available)")
 	}
 
 	baseLogger := services.NewDiscordLogger()
-	baseLogger.LogInfo("Server", "Backend started")
+	baseLogger.LogInfo("Server", "Backend started 🚀")
 
 	scriptBytes, err := os.ReadFile("./scripts/setup.sh")
 	if err != nil {
@@ -107,7 +166,7 @@ func main() {
 	r.Use(func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Real-IP")
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
@@ -140,8 +199,9 @@ func main() {
 		c.JSON(http.StatusOK, response)
 	})
 
-	r.POST("/api/install", func(c *gin.Context) {
+	r.POST("/api/install", rateLimitMiddleware(baseLogger), func(c *gin.Context) {
 		var req models.InstallRequest
+
 		if err := c.BindJSON(&req); err != nil {
 			baseLogger.LogError("API", "Invalid JSON Request", err.Error())
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
@@ -159,14 +219,17 @@ func main() {
 
 		go func(job *Job, request models.InstallRequest) {
 			sessionLog := &SessionLogger{
-					Job:           job,
-					DiscordLogger: baseLogger,
-				}
+				Job:           job,
+				DiscordLogger: baseLogger,
+			}
 
 			installerService := services.NewInstaller(scriptContent, sessionLog)
 
 			sessionLog.LogInfo("System", "Starting installation in the background...")
+
 			result := installerService.Install(request)
+
+			services.LogTargetServer(request.Host, result.Success, request.InstallMySQL)
 
 			job.mu.Lock()
 			job.Result = &result
@@ -183,10 +246,11 @@ func main() {
 
 		c.JSON(http.StatusOK, gin.H{
 			"status":  "started",
-			"message": "Instalation started.",
+			"message": "Installation started.",
 			"ip":      req.Host,
 		})
 	})
 
+	fmt.Println("Server running on port 8080")
 	r.Run(":8080")
 }
