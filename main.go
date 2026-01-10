@@ -1,18 +1,39 @@
 package main
 
 import (
-	"fivem-installer/models"
-	"fivem-installer/services"
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"sync"
 	"time"
+
+	"fivem-installer/models"
+	"fivem-installer/services"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	"golang.org/x/time/rate"
 )
+
+var validHostRegex = regexp.MustCompile(`^[a-zA-Z0-9.-]+$`)
+
+func isValidInput(input string) bool {
+	if len(input) > 255 || len(input) < 3 {
+		return false
+	}
+	return validHostRegex.MatchString(input)
+}
+
+func securityHeadersMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Writer.Header().Set("X-Frame-Options", "DENY")
+		c.Writer.Header().Set("X-Content-Type-Options", "nosniff")
+		c.Writer.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+
+		c.Next()
+	}
+}
 
 type Job struct {
 	IP        string
@@ -52,7 +73,6 @@ func (i *IPRateLimiter) GetLimiter(ip string) *rate.Limiter {
 		limiter = rate.NewLimiter(i.r, i.b)
 		i.ips[ip] = limiter
 	}
-
 	return limiter
 }
 
@@ -67,21 +87,17 @@ func rateLimitMiddleware(logger *services.DiscordLogger) gin.HandlerFunc {
 
 		l := limiter.GetLimiter(ip)
 		if !l.Allow() {
-			msg := fmt.Sprintf("IP %s hat das Rate-Limit überschritten und wurde temporär blockiert.", ip)
-
-			fmt.Printf("[RateLimit] BLOCKIERT: %s\n", ip)
-
-			logger.LogError("Security", "Rate Limit Hit 🛡️", msg)
+			logger.LogError("Security", "Rate Limit Hit 🛡️", fmt.Sprintf("IP %s wurde temporär blockiert.", ip))
+			fmt.Printf("[Security] Rate Limit Block: %s\n", ip)
 
 			c.JSON(http.StatusTooManyRequests, models.InstallResponse{
 				Success:   false,
-				Error:     "Too many requests. Please try again later.",
+				Error:     "Zu viele Versuche! Du bist für 1 Minute gesperrt.",
 				ErrorCode: "RATE_LIMIT",
 			})
 			c.Abort()
 			return
 		}
-
 		c.Next()
 	}
 }
@@ -130,7 +146,6 @@ func (l *SessionLogger) appendLog(prefix, msg string) {
 
 func (l *SessionLogger) LogInfo(section, msg string) {
 	l.appendLog(section, msg)
-
 	if section != "REMOTE" && section != "REMOTE_ERR" {
 		titleWithIP := fmt.Sprintf("%s | 🖥️ %s", section, l.Job.IP)
 		l.DiscordLogger.LogInfo(titleWithIP, msg)
@@ -140,19 +155,17 @@ func (l *SessionLogger) LogInfo(section, msg string) {
 func (l *SessionLogger) LogError(section, msg, err string) {
 	fullMsg := fmt.Sprintf("%s | Error: %s", msg, err)
 	l.appendLog("ERROR/"+section, fullMsg)
-
 	titleWithIP := fmt.Sprintf("%s | 🖥️ %s", section, l.Job.IP)
-
 	l.DiscordLogger.LogError(titleWithIP, msg, err)
 }
 
 func main() {
 	if err := godotenv.Load(); err != nil {
-		println("No .env file found (using system env vars if available)")
+		println("No .env file found (using system env vars)")
 	}
 
 	baseLogger := services.NewDiscordLogger()
-	baseLogger.LogInfo("Server", "Backend started 🚀")
+	baseLogger.LogInfo("Server", "Backend started successfully\nThe FiveM API backend is now running.")
 
 	scriptBytes, err := os.ReadFile("./scripts/setup.sh")
 	if err != nil {
@@ -161,7 +174,10 @@ func main() {
 	}
 	scriptContent := string(scriptBytes)
 
+	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
+
+	r.Use(securityHeadersMiddleware())
 
 	r.Use(func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
@@ -178,6 +194,11 @@ func main() {
 		host := c.Query("host")
 		if host == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Host parameter missing"})
+			return
+		}
+
+		if !isValidInput(host) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Host format"})
 			return
 		}
 
@@ -208,6 +229,16 @@ func main() {
 			return
 		}
 
+		if !isValidInput(req.Host) {
+			ip := c.ClientIP()
+			baseLogger.LogError("Security", "Injection Attempt Blocked ⚠️", fmt.Sprintf("IP: %s | Input: %s", ip, req.Host))
+
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "Ungültiges Format für Host/IP. Nur Buchstaben, Zahlen, Punkte und Bindestriche erlaubt.",
+			})
+			return
+		}
+
 		job, isBusy := getOrCreateJob(req.Host)
 		if isBusy {
 			c.JSON(http.StatusConflict, gin.H{
@@ -225,10 +256,9 @@ func main() {
 
 			installerService := services.NewInstaller(scriptContent, sessionLog)
 
-			sessionLog.LogInfo("System", "Starting installation in the background...")
+			sessionLog.LogInfo("System", "Starting installation process...")
 
 			result := installerService.Install(request)
-
 			services.LogTargetServer(request.Host, result.Success, request.InstallMySQL)
 
 			job.mu.Lock()
@@ -251,6 +281,9 @@ func main() {
 		})
 	})
 
-	fmt.Println("Server running on port 8080")
-	r.Run(":8080")
+	fmt.Println("Server running on port 8080 (Secure Mode)")
+	err = r.Run(":8080")
+	if err != nil {
+		return
+	}
 }
